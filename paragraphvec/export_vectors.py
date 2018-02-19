@@ -6,7 +6,7 @@ import fire
 import torch
 
 from paragraphvec.data import load_dataset
-from paragraphvec.models import DistributedMemory
+from paragraphvec.models import DM, DBOW
 from paragraphvec.utils import DATA_DIR, MODELS_DIR
 
 
@@ -23,30 +23,26 @@ def start(data_file_name, model_file_name):
         the *data_file_name* dataset).
     """
     dataset = load_dataset(data_file_name)
+
+    vec_dim = int(re.search('_vecdim\.(\d+)_', model_file_name).group(1))
+
     model = _load_model(
         model_file_name,
+        vec_dim,
         num_docs=len(dataset),
         num_words=len(dataset.fields['text'].vocab) - 1)
 
-    def qm(str_): return '\"' + str_ + '\"'
-
-    result_lines = []
-    with open(join(DATA_DIR, data_file_name)) as file:
-        lines = csv.reader(file)
-        for i, line in enumerate(lines):
-            result_line = [qm(x) if not x.isnumeric() else x for x in line[1:]]
-            result_line += [str(x) for x in model._D[i, :].data.tolist()]
-            result_lines.append(','.join(result_line) + '\n')
-
-    result_file_name = model_file_name[:-7] + 'csv'
-    with open(join(DATA_DIR, result_file_name), 'w') as f:
-        f.writelines(result_lines)
+    _write_to_file(data_file_name, model_file_name, model, vec_dim)
 
 
-def _load_model(model_file_name, num_docs, num_words):
-    vec_dim = int(re.search('_vecdim\.(\d+)_', model_file_name).group(1))
+def _load_model(model_file_name, vec_dim, num_docs, num_words):
+    model_ver = re.search('_model\.(dm|dbow)', model_file_name).group(1)
+    if model_ver is None:
+        raise ValueError("Model file name contains an invalid"
+                         "version of the model")
 
     model_file_path = join(MODELS_DIR, model_file_name)
+
     try:
         checkpoint = torch.load(model_file_path)
     except AssertionError:
@@ -54,9 +50,38 @@ def _load_model(model_file_name, num_docs, num_words):
             model_file_path,
             map_location=lambda storage, location: storage)
 
-    model = DistributedMemory(vec_dim, num_docs, num_words)
+    if model_ver == 'dbow':
+        model = DBOW(vec_dim, num_docs, num_words)
+    else:
+        model = DM(vec_dim, num_docs, num_words)
+
     model.load_state_dict(checkpoint['model_state_dict'])
     return model
+
+
+def _write_to_file(data_file_name, model_file_name, model, vec_dim):
+    result_lines = []
+
+    with open(join(DATA_DIR, data_file_name)) as f:
+        reader = csv.reader(f)
+
+        for i, line in enumerate(reader):
+            # skip text
+            result_line = line[1:]
+            if i == 0:
+                # header line
+                result_line += ["d{:d}".format(x) for x in range(vec_dim)]
+            else:
+                vector = model.get_paragraph_vector(i - 1)
+                result_line += [str(x) for x in vector]
+
+            result_lines.append(result_line)
+
+    result_file_name = model_file_name[:-7] + 'csv'
+
+    with open(join(DATA_DIR, result_file_name), 'w') as f:
+        writer = csv.writer(f)
+        writer.writerows(result_lines)
 
 
 if __name__ == '__main__':

@@ -1,7 +1,8 @@
 import multiprocessing
+import os
 import re
+import signal
 from math import ceil
-from os import cpu_count
 from os.path import join
 
 import numpy as np
@@ -22,7 +23,8 @@ def load_dataset(file_name):
     dataset = TabularDataset(
         path=file_path,
         format='csv',
-        fields=[('text', text_field)])
+        fields=[('text', text_field)],
+        skip_header=True)
 
     text_field.build_vocab(dataset)
     return dataset
@@ -84,7 +86,7 @@ class NCEData(object):
                  num_noise_words, max_size, num_workers):
         self.max_size = max_size
 
-        self.num_workers = num_workers if num_workers != -1 else cpu_count()
+        self.num_workers = num_workers if num_workers != -1 else os.cpu_count()
         if self.num_workers is None:
             self.num_workers = 1
 
@@ -137,7 +139,8 @@ class NCEData(object):
 
         for process in self._processes:
             if process.is_alive():
-                process.terminate()
+                os.kill(process.pid, signal.SIGINT)
+                process.join()
 
         if self._queue is not None:
             self._queue.close()
@@ -159,7 +162,7 @@ class _NCEGenerator(object):
     state: paragraphvec.data._NCEGeneratorState
         Initial (indexing) state of the generator.
 
-    For other parameters see the class NCEBatchPool.
+    For other parameters see the NCEData class.
     """
     def __init__(self, dataset, batch_size, context_size,
                  num_noise_words, state):
@@ -197,7 +200,7 @@ class _NCEGenerator(object):
 
     def next(self):
         """Updates state for the next process in a process-safe manner
-        and generates the current batch"""
+        and generates the current batch."""
         prev_doc_id, prev_in_doc_pos = self._state.update_state(
             self.dataset,
             self.batch_size,
@@ -205,12 +208,13 @@ class _NCEGenerator(object):
             self._num_examples_in_doc)
 
         # generate the actual batch
-        batch = _NCEBatch()
+        batch = _NCEBatch(self.context_size)
 
         while len(batch) < self.batch_size:
             if prev_doc_id == len(self.dataset):
                 # last document exhausted
-                return self._batch_to_torch_data(batch)
+                batch.torch_()
+                return batch
             if prev_in_doc_pos <= (len(self.dataset[prev_doc_id].text) - 1
                                    - self.context_size):
                 # more examples in the current document
@@ -221,7 +225,8 @@ class _NCEGenerator(object):
                 prev_doc_id += 1
                 prev_in_doc_pos = self.context_size
 
-        return self._batch_to_torch_data(batch)
+        batch.torch_()
+        return batch
 
     def _num_examples_in_doc(self, doc, in_doc_pos=None):
         if in_doc_pos is not None:
@@ -239,32 +244,26 @@ class _NCEGenerator(object):
         doc = self.dataset[doc_id].text
         batch.doc_ids.append(doc_id)
 
-        current_context = []
-        for i in range(-self.context_size, self.context_size + 1):
-            if i != 0:
-                current_context.append(self._word_to_index(doc[in_doc_pos - i]))
-        batch.context_ids.append(current_context)
-
         # sample from the noise distribution
         current_noise = self._sample_noise()
         current_noise.insert(0, self._word_to_index(doc[in_doc_pos]))
         batch.target_noise_ids.append(current_noise)
 
+        if self.context_size == 0:
+            return
+
+        current_context = []
+        context_indices = (in_doc_pos + diff for diff in
+                           range(-self.context_size, self.context_size + 1)
+                           if diff != 0)
+
+        for i in context_indices:
+            context_id = self._word_to_index(doc[i])
+            current_context.append(context_id)
+        batch.context_ids.append(current_context)
+
     def _word_to_index(self, word):
         return self._vocabulary.stoi[word] - 1
-
-    @staticmethod
-    def _batch_to_torch_data(batch):
-        batch.context_ids = torch.LongTensor(batch.context_ids)
-        batch.doc_ids = torch.LongTensor(batch.doc_ids)
-        batch.target_noise_ids = torch.LongTensor(batch.target_noise_ids)
-
-        if torch.cuda.is_available():
-            batch.context_ids = batch.context_ids.cuda()
-            batch.doc_ids = batch.doc_ids.cuda()
-            batch.target_noise_ids = batch.target_noise_ids.cuda()
-
-        return batch
 
 
 class _NCEGeneratorState(object):
@@ -324,10 +323,22 @@ class _NCEGeneratorState(object):
 
 
 class _NCEBatch(object):
-    def __init__(self):
-        self.context_ids = []
+    def __init__(self, context_size):
+        self.context_ids = [] if context_size > 0 else None
         self.doc_ids = []
         self.target_noise_ids = []
 
     def __len__(self):
         return len(self.doc_ids)
+
+    def torch_(self):
+        if self.context_ids is not None:
+            self.context_ids = torch.LongTensor(self.context_ids)
+        self.doc_ids = torch.LongTensor(self.doc_ids)
+        self.target_noise_ids = torch.LongTensor(self.target_noise_ids)
+
+    def cuda_(self):
+        if self.context_ids is not None:
+            self.context_ids = self.context_ids.cuda()
+        self.doc_ids = self.doc_ids.cuda()
+        self.target_noise_ids = self.target_noise_ids.cuda()
